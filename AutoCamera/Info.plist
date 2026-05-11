@@ -2,6 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSCameraUsageDescription</key>
+	<string>需要使用相机进行实时预览、姿态识别与智能抓拍。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>后续视频拍摄能力需要访问麦克风。</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>需要将智能抓拍照片保存到相册。</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
