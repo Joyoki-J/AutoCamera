@@ -11,22 +11,38 @@ struct SmartCaptureScore {
     let motionScore: Float
     let momentScore: Float
     let gestureScore: Float
+    let wideEyesScore: Float      // 睁大眼睛检测
+    let eyeOpenness: Float        // 眼睛睁开程度
 }
 
 enum SmartCaptureGesture {
-    case peace        // ✨️ 比耶
-    case thumbsUp     // 👍 比个大拇哥
-    case openPalm     // ✋ 五指张开挥手
+    case peace        // 比耶
+    case thumbsUp     // 比个大拇哥
+    case openPalm     // 五指张开挥手
+}
+
+private struct PoseSignature {
+    let smile: Float
+    let eyeOpen: Float
+    let wideEyes: Float
+    let mouthOpen: Float
+    let eyebrowLift: Float
+    let gesture: Float
+    let emotion: Float
+    let motion: Float
+    let faceCenter: CGPoint
+    let faceSize: Float
 }
 
 final class SmartCaptureScorer {
-    private let threshold: Float = 0.58
-    private let peakThreshold: Float = 0.70
-    private let requiredPassingFrames = 3
-    private let cooldownFrames = 50                // ≈2.5s @ 20fps
-    private let minRawFaceQuality: Float = 0.38    // 半张脸/糊脸通常 < 0.30
-    private let minFaceArea: Float = 0.035         // 太小的远距离脸拒绝
-    private let noveltyMargin: Float = 0.10        // 表情连拍防护：需比近期基线明显变高
+    private let threshold: Float = 0.42
+    private let peakThreshold: Float = 0.55
+    private let requiredPassingFrames = 2
+    private let cooldownFrames = 15                // ≈0.75s @ 20fps
+    private let minRawFaceQuality: Float = 0.22
+    private let minFaceArea: Float = 0.018
+    private let noveltyMargin: Float = 0.12
+    private let signatureChangeThreshold: Float = 0.22
 
     private var passingFrameCount = 0
     private var cooldown = 0
@@ -34,9 +50,18 @@ final class SmartCaptureScorer {
     private var recentFaceBoxes: [CGRect] = []
     private var previousMouthOpenness: Float?
     private var previousEyebrowLift: Float?
+    private var previousEyeOpenness: Float?
+    private var previousWideEyes: Float?
     private var previousPoseCenter: CGPoint?
     private let windowSize = 40
     private let lock = NSLock()
+
+    // 签名状态机：记录上次拍照的pose特征，检测用户是否摆出了新pose
+    private var lastCapturedSignature: PoseSignature?
+    private var currentSignature: PoseSignature?
+    private var stableSignature: PoseSignature?
+    private var stableFrameCount = 0
+    private let stableFramesRequired = 6
 
     func reset() {
         lock.lock(); defer { lock.unlock() }
@@ -46,7 +71,20 @@ final class SmartCaptureScorer {
         recentFaceBoxes.removeAll()
         previousMouthOpenness = nil
         previousEyebrowLift = nil
+        previousEyeOpenness = nil
+        previousWideEyes = nil
         previousPoseCenter = nil
+        stableFrameCount = 0
+        // 保留 lastCapturedSignature，避免拍照后立即重复触发
+    }
+
+    /// 彻底清空签名状态（模式切换/摄像头切换时调用）
+    func clearCapturedSignature() {
+        lock.lock(); defer { lock.unlock() }
+        lastCapturedSignature = nil
+        stableSignature = nil
+        stableFrameCount = 0
+        currentSignature = nil
     }
 
     func evaluate(qualityObservations: [VNFaceObservation],
@@ -74,14 +112,18 @@ final class SmartCaptureScorer {
         let quality = normalizedQuality(rawFaceQuality(best))
         let expression = expressionMetrics(landmarkFace)
         let smile = expression.smile
+        let wideEyes = expression.wideEyes
+        let eyeOpen = expression.eyeOpen
         let expressionChange = expressionChangeScore(mouthOpenness: expression.mouthOpenness,
-                                                     eyebrowLift: expression.eyebrowLift)
-        let emotion = clamped(max(expression.smile, expression.surprise, expression.squintJoy) * 0.78 + expressionChange * 0.22)
+                                                     eyebrowLift: expression.eyebrowLift,
+                                                     eyeOpenness: eyeOpen,
+                                                     wideEyes: wideEyes)
+        let emotion = clamped(max(expression.smile, expression.surprise, expression.squintJoy, expression.wideEyes * 0.88) * 0.75 + expressionChange * 0.25)
         let motion = motionScore(faceBox: best.boundingBox, bodyPoseObservations: bodyPoseObservations)
         let gesture = handGestureScore(handPoseObservations)
         let composition = compositionScore(for: best)
-        let moment = clamped(emotion * 0.52 + max(motion, expressionChange) * 0.22 + gesture * 0.20 + composition * 0.06)
-        let value = clamped(emotion * 0.40 + gesture * 0.22 + motion * 0.16 + composition * 0.12 + quality * 0.08 + expressionChange * 0.02)
+        let moment = clamped(emotion * 0.50 + max(motion, expressionChange) * 0.22 + gesture * 0.20 + composition * 0.08)
+        let value = clamped(emotion * 0.38 + gesture * 0.22 + motion * 0.14 + composition * 0.12 + quality * 0.08 + expressionChange * 0.04 + wideEyes * 0.02)
 
         let score = SmartCaptureScore(value: value,
                                       captureQuality: quality,
@@ -90,11 +132,29 @@ final class SmartCaptureScorer {
                                       emotionScore: emotion,
                                       motionScore: motion,
                                       momentScore: moment,
-                                      gestureScore: gesture)
+                                      gestureScore: gesture,
+                                      wideEyesScore: wideEyes,
+                                      eyeOpenness: eyeOpen)
         recentScores.append(score)
         if recentScores.count > windowSize { recentScores.removeFirst() }
         recentFaceBoxes.append(best.boundingBox)
         if recentFaceBoxes.count > windowSize { recentFaceBoxes.removeFirst() }
+
+        // 更新签名状态机：记录当前pose特征，用于检测用户是否摆出新pose
+        let sig = PoseSignature(
+            smile: smile,
+            eyeOpen: eyeOpen,
+            wideEyes: wideEyes,
+            mouthOpen: expression.mouthOpenness,
+            eyebrowLift: expression.eyebrowLift,
+            gesture: gesture,
+            emotion: emotion,
+            motion: motion,
+            faceCenter: CGPoint(x: best.boundingBox.midX, y: best.boundingBox.midY),
+            faceSize: Float(best.boundingBox.width * best.boundingBox.height)
+        )
+        currentSignature = sig
+        updateStableState(signature: sig)
 
         if faceUsable && (value > threshold || moment > threshold) {
             passingFrameCount += 1
@@ -111,26 +171,52 @@ final class SmartCaptureScorer {
         lock.lock(); defer { lock.unlock() }
         guard cooldown == 0 else { return false }
 
-        // 硬门槛复核：脸过小 / 质量过低直接拒绝（构图门槛调低）。
-        guard score.captureQuality >= 0.30, score.compositionScore >= 0.30 else { return false }
+        // 硬门槛复核
+        guard score.captureQuality >= 0.20, score.compositionScore >= 0.20 else { return false }
 
+        // 计算与上次拍照的签名差异
+        let sigDist: Float
+        let hasLastCapture: Bool
+        if let last = lastCapturedSignature, let current = currentSignature {
+            sigDist = signatureDistance(current: current, previous: last)
+            hasLastCapture = true
+        } else {
+            sigDist = 0
+            hasLastCapture = false
+        }
+
+        // 传统 novelty 检测
         let baseline = recentBaseline()
         let isNovel = score.value >= baseline + noveltyMargin
             || score.momentScore >= baseline + noveltyMargin
 
-        // 明确的“拍照手势”是独立触发分支，不要求累计帧数，但需要设备认为是一个“新手势”。
-        let gestureCapture = score.gestureScore >= 0.78 && gestureNoveltyOK()
+        // 核心：新Pose触发 —— 与上次拍照的pose差异足够大，且当前值得拍
+        let novelPoseTrigger = hasLastCapture
+            && sigDist >= signatureChangeThreshold
+            && score.emotionScore >= 0.28
+            && score.value >= 0.38
+            && passingFrameCount >= 1
 
-        let sustained = passingFrameCount >= requiredPassingFrames && isNovel
-        let emotionalPeak = score.emotionScore >= peakThreshold && score.compositionScore >= 0.40 && isNovel
-        let actionPeak = score.motionScore >= peakThreshold
-            && (score.emotionScore >= 0.35 || score.gestureScore >= 0.45)
-            && score.value >= 0.55
+        // 手势直接触发（阈值降低，响应更快）
+        let gestureTrigger = score.gestureScore >= 0.60 && gestureNoveltyOK()
 
-        let should = sustained || emotionalPeak || actionPeak || gestureCapture
+        // 情绪峰值（降低门槛）
+        let emotionalPeak = score.emotionScore >= peakThreshold && score.compositionScore >= 0.25 && isNovel
+
+        // 动作峰值
+        let actionPeak = score.motionScore >= 0.50
+            && (score.emotionScore >= 0.30 || score.gestureScore >= 0.40)
+
+        // 持续高分
+        let sustained = passingFrameCount >= requiredPassingFrames && isNovel && score.value >= 0.42
+
+        let should = novelPoseTrigger || gestureTrigger || emotionalPeak || actionPeak || sustained
         if should {
             cooldown = cooldownFrames
             passingFrameCount = 0
+            if let current = currentSignature {
+                lastCapturedSignature = current
+            }
         }
         return should
     }
@@ -146,6 +232,40 @@ final class SmartCaptureScorer {
         let window = recentScores.suffix(12).map(\.value).sorted()
         guard !window.isEmpty else { return 0 }
         return window[window.count / 2]
+    }
+
+    // MARK: - Signature state machine
+
+    private func signatureDistance(current: PoseSignature, previous: PoseSignature) -> Float {
+        var dist: Float = 0
+        dist += abs(current.smile - previous.smile) * 0.25
+        dist += abs(current.wideEyes - previous.wideEyes) * 0.20
+        dist += abs(current.mouthOpen - previous.mouthOpen) * 0.12
+        dist += abs(current.eyebrowLift - previous.eyebrowLift) * 0.08
+        dist += abs(current.gesture - previous.gesture) * 0.30
+        dist += abs(current.emotion - previous.emotion) * 0.15
+        dist += abs(current.motion - previous.motion) * 0.08
+        dist += Float(hypot(current.faceCenter.x - previous.faceCenter.x, current.faceCenter.y - previous.faceCenter.y)) * 0.30
+        dist += abs(current.faceSize - previous.faceSize) * 0.15
+        return clamped(dist)
+    }
+
+    private func updateStableState(signature: PoseSignature) {
+        guard stableSignature != nil else {
+            stableSignature = signature
+            stableFrameCount = 1
+            return
+        }
+        guard let stable = stableSignature else { return }
+        let dist = signatureDistance(current: signature, previous: stable)
+        if dist < 0.08 {
+            stableFrameCount += 1
+            if stableFrameCount >= stableFramesRequired {
+                stableSignature = signature
+            }
+        } else {
+            stableFrameCount = max(0, stableFrameCount - 2)
+        }
     }
 
     // MARK: - Hand gesture
@@ -239,29 +359,32 @@ final class SmartCaptureScorer {
         clamped((q - 0.2) / 0.5)
     }
 
-    private func expressionMetrics(_ f: VNFaceObservation) -> (smile: Float, surprise: Float, squintJoy: Float, mouthOpenness: Float, eyebrowLift: Float) {
+    private func expressionMetrics(_ f: VNFaceObservation) -> (smile: Float, surprise: Float, squintJoy: Float, mouthOpenness: Float, eyebrowLift: Float, eyeOpen: Float, wideEyes: Float) {
         let outer = f.landmarks?.outerLips?.normalizedPoints ?? []
         let leftEye = f.landmarks?.leftEye?.normalizedPoints ?? []
         let rightEye = f.landmarks?.rightEye?.normalizedPoints ?? []
         let leftBrow = f.landmarks?.leftEyebrow?.normalizedPoints ?? []
         let rightBrow = f.landmarks?.rightEyebrow?.normalizedPoints ?? []
         let mouth = rectMetrics(points: outer)
-        let smileWidth = clamped((mouth.width / max(mouth.height, 0.001) - 1.8) / 1.8)
-        let smile = clamped(smileWidth * 0.56 + lipCornerLift(points: outer) * 0.44)
+        let smileWidth = clamped((mouth.width / max(mouth.height, 0.001) - 1.5) / 2.0)
+        let smile = clamped(smileWidth * 0.50 + lipCornerLift(points: outer) * 0.50)
         let eyeOpen = (eyeOpenScore(leftEye) + eyeOpenScore(rightEye)) * 0.5
         let eyebrowLift = eyebrowLiftScore(leftEye: leftEye, rightEye: rightEye, leftBrow: leftBrow, rightBrow: rightBrow)
-        let surprise = clamped(mouth.height * 3.2 + eyeOpen * 0.42 + eyebrowLift * 0.36 - 0.35)
-        let squintJoy = clamped(smile * 0.72 + clamped(1.0 - eyeOpen * 1.7) * 0.28)
-        return (smile, surprise, squintJoy, mouth.height, eyebrowLift)
+        let wideEyes = clamped((eyeOpen - 0.40) / 0.42)
+        let surprise = clamped(mouth.height * 3.0 + eyeOpen * 0.45 + eyebrowLift * 0.35 - 0.18 + wideEyes * 0.12)
+        let squintJoy = clamped(smile * 0.72 + clamped(1.0 - eyeOpen * 1.6) * 0.28)
+        return (smile, surprise, squintJoy, mouth.height, eyebrowLift, eyeOpen, wideEyes)
     }
 
-    private func expressionChangeScore(mouthOpenness: Float, eyebrowLift: Float) -> Float {
+    private func expressionChangeScore(mouthOpenness: Float, eyebrowLift: Float, eyeOpenness: Float, wideEyes: Float) -> Float {
         defer {
             previousMouthOpenness = mouthOpenness
             previousEyebrowLift = eyebrowLift
+            previousEyeOpenness = eyeOpenness
+            previousWideEyes = wideEyes
         }
-        guard let previousMouthOpenness, let previousEyebrowLift else { return 0 }
-        return clamped(abs(mouthOpenness - previousMouthOpenness) * 4.0 + abs(eyebrowLift - previousEyebrowLift) * 2.5)
+        guard let previousMouthOpenness, let previousEyebrowLift, let previousEyeOpenness, let previousWideEyes else { return 0 }
+        return clamped(abs(mouthOpenness - previousMouthOpenness) * 3.5 + abs(eyebrowLift - previousEyebrowLift) * 2.0 + abs(eyeOpenness - previousEyeOpenness) * 2.5 + abs(wideEyes - previousWideEyes) * 2.0)
     }
 
     private func motionScore(faceBox: CGRect, bodyPoseObservations: [VNHumanBodyPoseObservation]) -> Float {

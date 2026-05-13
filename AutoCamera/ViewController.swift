@@ -321,9 +321,10 @@ extension ViewController: CameraControllerDelegate {
         }
         planTitleLabel.text = plan.subject == .portrait ? "🎬 人物导演" : "🏞 风景导演"
         planBodyLabel.text = plan.summary
+        self.compositionOverlay.compositionMode = plan.composition
         UIView.animate(withDuration: 0.2) {
             self.planCard.alpha = 1
-            self.compositionOverlay.alpha = (plan.subject == .scene) ? 1 : 0
+            self.compositionOverlay.alpha = 1
         }
     }
 
@@ -342,11 +343,18 @@ extension ViewController: CameraControllerDelegate {
             return
         }
         scoreLabel.text = "抓拍评分 \(Int(score.value * 100))"
-        scoreDetailLabel.text = String(format: "情绪 %d · 手势 %d · 动作 %d · 构图 %d",
-                                       Int(score.emotionScore * 100),
-                                       Int(score.gestureScore * 100),
-                                       Int(score.motionScore * 100),
-                                       Int(score.compositionScore * 100))
+        var detail = String(format: "情绪%d 手势%d 动作%d 构图%d",
+                            Int(score.emotionScore * 100),
+                            Int(score.gestureScore * 100),
+                            Int(score.motionScore * 100),
+                            Int(score.compositionScore * 100))
+        if score.wideEyesScore > 0.35 {
+            detail += " 👀睁大"
+        }
+        if score.eyeOpenness > 0.7 {
+            detail += " 😮惊讶"
+        }
+        scoreDetailLabel.text = detail
         UIView.animate(withDuration: 0.2) { self.scoreCard.alpha = 1 }
     }
 
@@ -367,8 +375,12 @@ extension ViewController: CameraControllerDelegate {
     }
 }
 
-/// 智拍·风景模式下的"三分线"取景辅助。
+/// 智拍模式下的构图辅助线，支持多种构图模式。
 final class CompositionOverlayView: UIView {
+    var compositionMode: String? = nil {
+        didSet { setNeedsDisplay() }
+    }
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
@@ -377,14 +389,42 @@ final class CompositionOverlayView: UIView {
 
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
-        ctx.setStrokeColor(UIColor.white.withAlphaComponent(0.55).cgColor)
-        ctx.setLineWidth(1)
-        let w = rect.width / 3, h = rect.height / 3
-        for i in 1...2 {
-            ctx.move(to: CGPoint(x: w * CGFloat(i), y: 0))
-            ctx.addLine(to: CGPoint(x: w * CGFloat(i), y: rect.height))
-            ctx.move(to: CGPoint(x: 0, y: h * CGFloat(i)))
-            ctx.addLine(to: CGPoint(x: rect.width, y: h * CGFloat(i)))
+        ctx.setStrokeColor(UIColor.yellow.withAlphaComponent(0.60).cgColor)
+        ctx.setLineWidth(1.5)
+        ctx.setLineDash(phase: 0, lengths: [6, 4])
+
+        let w = rect.width, h = rect.height
+        let mode = compositionMode?.lowercased() ?? "thirds"
+
+        switch mode {
+        case "center":
+            // 中心构图：画一个中心十字
+            ctx.move(to: CGPoint(x: w * 0.5, y: h * 0.35))
+            ctx.addLine(to: CGPoint(x: w * 0.5, y: h * 0.65))
+            ctx.move(to: CGPoint(x: w * 0.35, y: h * 0.5))
+            ctx.addLine(to: CGPoint(x: w * 0.65, y: h * 0.5))
+            // 中心框
+            ctx.addRect(CGRect(x: w * 0.35, y: h * 0.30, width: w * 0.30, height: h * 0.40))
+        case "left":
+            // 左三分之一
+            ctx.move(to: CGPoint(x: w / 3, y: 0))
+            ctx.addLine(to: CGPoint(x: w / 3, y: h))
+            ctx.move(to: CGPoint(x: w * 0.15, y: h * 0.3))
+            ctx.addLine(to: CGPoint(x: w * 0.15, y: h * 0.7))
+        case "right":
+            // 右三分之一
+            ctx.move(to: CGPoint(x: w * 2 / 3, y: 0))
+            ctx.addLine(to: CGPoint(x: w * 2 / 3, y: h))
+            ctx.move(to: CGPoint(x: w * 0.85, y: h * 0.3))
+            ctx.addLine(to: CGPoint(x: w * 0.85, y: h * 0.7))
+        default:
+            // 三分线（默认）
+            for i in 1...2 {
+                ctx.move(to: CGPoint(x: w * CGFloat(i) / 3, y: 0))
+                ctx.addLine(to: CGPoint(x: w * CGFloat(i) / 3, y: h))
+                ctx.move(to: CGPoint(x: 0, y: h * CGFloat(i) / 3))
+                ctx.addLine(to: CGPoint(x: w, y: h * CGFloat(i) / 3))
+            }
         }
         ctx.strokePath()
     }

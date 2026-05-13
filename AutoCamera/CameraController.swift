@@ -215,6 +215,7 @@ final class CameraController: NSObject {
         currentMLXTask = nil
         poseGuideEngine.reset()
         smartCaptureScorer.reset()
+        smartCaptureScorer.clearCapturedSignature()
     }
 
     /// 文档热降频要求：`.serious / .critical` 时 Vision 强制 5fps。
@@ -235,18 +236,52 @@ final class CameraController: NSObject {
             guard let self else { return }
             defer { self.videoOutputQueue.async { self.isVisionBusy = false } }
             let bodyPose = VNDetectHumanBodyPoseRequest()
+            let faceLandmarks = VNDetectFaceLandmarksRequest()
+            let faceQuality = VNDetectFaceCaptureQualityRequest()
             let saliency = VNGenerateAttentionBasedSaliencyImageRequest()
             let orientation: CGImagePropertyOrientation = frontCam ? .leftMirrored : .right
             let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
             do {
-                try handler.perform([bodyPose, saliency])
+                try handler.perform([bodyPose, faceLandmarks, faceQuality, saliency])
                 let personObs = bodyPose.results?.first
-                let hasPerson = (personObs?.confidence ?? 0) > 0.3
+                let faceObs = faceLandmarks.results?.first
+                let hasPerson = (personObs?.confidence ?? 0) > 0.3 || (faceObs?.confidence ?? 0) > 0.3
                 self.videoOutputQueue.async { self.hasPersonRecently = hasPerson }
-                if hasPerson, let obs = personObs {
-                    let result = self.poseGuideEngine.evaluate(obs)
-                    DispatchQueue.main.async {
-                        self.delegate?.cameraController(self, didUpdatePoseGuide: result)
+
+                // 人物模式：人脸检测 + 姿态引导 + 自动对焦人脸
+                if hasPerson {
+                    // 自动对焦到人脸中心
+                    if let face = faceObs {
+                        let faceBox = face.boundingBox
+                        let faceCenter = CGPoint(x: faceBox.midX, y: faceBox.midY)
+                        self.applyFocus(normalizedPoint: faceCenter)
+                        // 人脸质量反馈
+                        let quality = face.faceCaptureQuality ?? face.confidence
+                        let area = Float(faceBox.width * faceBox.height)
+                        var qualityMsg = ""
+                        if quality < 0.25 {
+                            qualityMsg = "人脸有些模糊，请保持稳定"
+                        } else if area < 0.025 {
+                            qualityMsg = "人脸太小，请靠近一点"
+                        } else if area > 0.45 {
+                            qualityMsg = "人脸太近，请稍微后退"
+                        }
+                        if !qualityMsg.isEmpty {
+                            DispatchQueue.main.async {
+                                self.delegate?.cameraController(self, didUpdateStatus: qualityMsg)
+                            }
+                        }
+                    }
+                    // 姿态引导
+                    if let obs = personObs {
+                        let result = self.poseGuideEngine.evaluate(obs)
+                        DispatchQueue.main.async {
+                            self.delegate?.cameraController(self, didUpdatePoseGuide: result)
+                        }
+                    } else {
+                        DispatchQueue.main.async {
+                            self.delegate?.cameraController(self, didUpdatePoseGuide: PoseGuideResult(isSatisfied: true, message: nil, direction: nil))
+                        }
                     }
                 } else {
                     // 风景模式：使用注意力显著性自动对焦兴趣主体
@@ -278,12 +313,10 @@ final class CameraController: NSObject {
             var stillCoach = false
             self.videoOutputQueue.sync { stillCoach = (self.mode == .coach) }
             guard stillCoach else { return }
-            // 把导演计划落地：动态姿态约束 / 风景的变焦与对焦
+            // 把导演计划落地：动态姿态约束 / 变焦与对焦 / 构图模式
             self.poseGuideEngine.setConstraints(plan.poseConstraints)
-            if plan.subject == .scene {
-                if let zoom = plan.suggestedZoom { self.applyZoom(factor: zoom) }
-                if let focus = plan.suggestedFocusPoint { self.applyFocus(normalizedPoint: focus) }
-            }
+            if let zoom = plan.suggestedZoom { self.applyZoom(factor: zoom) }
+            if let focus = plan.suggestedFocusPoint { self.applyFocus(normalizedPoint: focus) }
             await MainActor.run {
                 self.delegate?.cameraController(self, didUpdateDirectorPlan: plan)
                 self.delegate?.cameraController(self, didUpdateStatus: plan.summary)

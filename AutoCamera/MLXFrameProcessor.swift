@@ -38,8 +38,8 @@ actor MLXFrameProcessor {
         #if canImport(MLX) && canImport(MLXHuggingFace) && canImport(MLXLMCommon) && canImport(MLXVLM) && canImport(Tokenizers)
         let image = CIImage(cvPixelBuffer: resized)
         let systemPrompt = hasPerson
-            ? "你是一位专业摄影导演，正在指导用户拍人物。严格输出 JSON：{\"subject\":\"portrait\",\"summary\":\"一句中文构图建议\",\"pose\":\"(可选)简短姿态指令\"}"
-            : "你是一位专业摄影导演，正在拍风景。严格输出 JSON：{\"subject\":\"scene\",\"summary\":\"一句中文构图建议\",\"zoom\":1.0,\"focus_x\":0.5,\"focus_y\":0.5}。zoom 1.0~3.0，focus_x/y 为兴趣主体的归一化坐标。"
+            ? "你是一位专业摄影导演，正在实时指导用户拍人物。根据画面给出具体可操作的导演建议，包含构图、姿态、焦距调整。严格输出 JSON：{\"subject\":\"portrait\",\"summary\":\"简短中文构图建议（15字以内）\",\"pose\":\"具体姿态指令，如：稍微抬头、肩膀放松、举左手、叉腰、侧脸等\",\"zoom\":1.0,\"focus_x\":0.5,\"focus_y\":0.5,\"composition\":\"center\"}。zoom 1.0~2.5，focus_x/y 为人物面部中心的归一化坐标（0~1），composition 可选 center/left/right/thirds。"
+            : "你是一位专业摄影导演，正在拍风景。根据画面给出具体构图建议。严格输出 JSON：{\"subject\":\"scene\",\"summary\":\"简短中文构图建议\",\"zoom\":1.0,\"focus_x\":0.5,\"focus_y\":0.5,\"composition\":\"thirds\"}。zoom 1.0~3.0，focus_x/y 为兴趣主体的归一化坐标，composition 可选 thirds/center/leading_lines。"
         do {
             let container = try await loadContainer(progressHandler: nil)
             let userInput = UserInput(
@@ -79,15 +79,17 @@ actor MLXFrameProcessor {
                     : "AI 导演正在加载中，可以试试三分线构图，再按快门。",
                 poseConstraints: [],
                 suggestedZoom: nil,
-                suggestedFocusPoint: nil)
+                suggestedFocusPoint: nil,
+                composition: nil)
         }
         #else
         let fallback = DirectorPlan(
             subject: hasPerson ? .portrait : .scene,
-            summary: hasPerson ? "让主体稍微偏向三分线，肩膀放松微笑。" : "把地平线放在下三分之一线，突出天空层次。",
+            summary: hasPerson ? "让人物位于画面中心，肩膀放松微笑。" : "把地平线放在下三分之一线，突出天空层次。",
             poseConstraints: [],
             suggestedZoom: nil,
-            suggestedFocusPoint: nil)
+            suggestedFocusPoint: nil,
+            composition: nil)
         lastPlan = fallback
         return fallback
         #endif
@@ -131,46 +133,83 @@ actor MLXFrameProcessor {
                 if let fx = obj["focus_x"] as? Double, let fy = obj["focus_y"] as? Double {
                     focus = CGPoint(x: fx, y: fy)
                 }
+                var composition: String?
+                if let comp = obj["composition"] as? String, !comp.isEmpty {
+                    composition = comp
+                }
                 return DirectorPlan(subject: subject,
                                     summary: summary.isEmpty ? cleaned : summary,
                                     poseConstraints: constraints,
                                     suggestedZoom: zoom,
-                                    suggestedFocusPoint: focus)
+                                    suggestedFocusPoint: focus,
+                                    composition: composition)
             }
         }
         return DirectorPlan(subject: fallbackPortrait ? .portrait : .scene,
                             summary: cleaned.isEmpty ? "正在分析构图与姿态..." : cleaned,
                             poseConstraints: [],
                             suggestedZoom: nil,
-                            suggestedFocusPoint: nil)
+                            suggestedFocusPoint: nil,
+                            composition: nil)
     }
 
     /// 把模型输出的中文姿态指令映射为可执行的姿态约束（简化关键词匹配）。
     private static func constraints(fromPoseText text: String) -> [PoseConstraint] {
         let t = text
         var result: [PoseConstraint] = []
-        if t.contains("举起左手") || t.contains("抬起左手") || t.contains("左手高") {
+        if t.contains("举") && t.contains("左手") || t.contains("抬") && t.contains("左手") || t.contains("左手") && t.contains("高") {
             result.append(PoseConstraint(targetJoint: .leftWrist, referenceJoint: .nose,
-                                         relation: .higherThan, threshold: 0.08,
-                                         guidanceText: "请抬高左手"))
+                                         relation: .higherThan, threshold: 0.06,
+                                         guidanceText: "请抬高左手 ✋"))
         }
-        if t.contains("举起右手") || t.contains("抬起右手") || t.contains("右手高") {
+        if t.contains("举") && t.contains("右手") || t.contains("抬") && t.contains("右手") || t.contains("右手") && t.contains("高") {
             result.append(PoseConstraint(targetJoint: .rightWrist, referenceJoint: .nose,
-                                         relation: .higherThan, threshold: 0.08,
-                                         guidanceText: "请抬高右手"))
+                                         relation: .higherThan, threshold: 0.06,
+                                         guidanceText: "请抬高右手 ✋"))
         }
-        if t.contains("叉腰") {
-            result.append(PoseConstraint(targetJoint: .leftWrist, referenceJoint: .leftShoulder,
-                                         relation: .lowerThan, threshold: 0.05,
+        if t.contains("叉腰") || t.contains("腰") {
+            result.append(PoseConstraint(targetJoint: .leftWrist, referenceJoint: .leftHip,
+                                         relation: .lowerThan, threshold: 0.03,
                                          guidanceText: "左手放到腰间"))
-            result.append(PoseConstraint(targetJoint: .rightWrist, referenceJoint: .rightShoulder,
-                                         relation: .lowerThan, threshold: 0.05,
+            result.append(PoseConstraint(targetJoint: .rightWrist, referenceJoint: .rightHip,
+                                         relation: .lowerThan, threshold: 0.03,
                                          guidanceText: "右手放到腰间"))
         }
-        if t.contains("侧脸") || t.contains("看向左") {
+        if t.contains("侧脸") || t.contains("向左") || t.contains("左转") {
             result.append(PoseConstraint(targetJoint: .nose, referenceJoint: .leftEye,
                                          relation: .leftOf, threshold: 0.02,
                                          guidanceText: "脸稍稍偏向左侧"))
+        }
+        if t.contains("向右") || t.contains("右转") {
+            result.append(PoseConstraint(targetJoint: .nose, referenceJoint: .rightEye,
+                                         relation: .rightOf, threshold: 0.02,
+                                         guidanceText: "脸稍稍偏向右侧"))
+        }
+        if t.contains("抬头") || t.contains("仰视") {
+            result.append(PoseConstraint(targetJoint: .nose, referenceJoint: .neck,
+                                         relation: .higherThan, threshold: 0.04,
+                                         guidanceText: "请稍微抬头"))
+        }
+        if t.contains("低头") || t.contains("俯视") {
+            result.append(PoseConstraint(targetJoint: .nose, referenceJoint: .neck,
+                                         relation: .lowerThan, threshold: 0.04,
+                                         guidanceText: "请稍微低头"))
+        }
+        if t.contains("肩膀") && (t.contains("放松") || t.contains("下沉")) {
+            result.append(PoseConstraint(targetJoint: .leftShoulder, referenceJoint: .rightShoulder,
+                                         relation: .lowerThan, threshold: 0.02,
+                                         guidanceText: "肩膀放松下沉"))
+        }
+        if t.contains("站") && t.contains("直") || t.contains("挺直") {
+            result.append(PoseConstraint(targetJoint: .neck, referenceJoint: .leftHip,
+                                         relation: .higherThan, threshold: 0.10,
+                                         guidanceText: "请挺直身体"))
+        }
+        if t.contains("笑") || t.contains("微笑") {
+            // 姿态约束无法直接检测微笑，通过 guidanceText 提示
+            result.append(PoseConstraint(targetJoint: .nose, referenceJoint: .neck,
+                                         relation: .higherThan, threshold: -0.10,
+                                         guidanceText: "保持自然微笑 😊"))
         }
         return result
     }

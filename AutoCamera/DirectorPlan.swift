@@ -7,6 +7,7 @@ struct DirectorPlan {
     var subject: SubjectKind
     var summary: String                 // 给用户看的一句中文构图建议
     var poseConstraints: [PoseConstraint]
-    var suggestedZoom: CGFloat?         // 推荐变焦倍数（风景模式）
+    var suggestedZoom: CGFloat?         // 推荐变焦倍数
     var suggestedFocusPoint: CGPoint?   // 归一化 0~1 坐标
+    var composition: String?            // 构图模式: center/left/right/thirds/leading_lines
 }
