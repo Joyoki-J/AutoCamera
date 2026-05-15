@@ -32,6 +32,7 @@ final class CameraController: NSObject {
     // 两个模式各自一套引擎，运行期不交叉调用。
     private let poseGuideEngine = PoseGuideEngine()
     private let smartCaptureScorer = SmartCaptureScorer()
+    private let smartCaptureEngine = UltimateSmartCaptureEngine()
     private let mlxFrameProcessor = MLXFrameProcessor.shared
     private let notificationGenerator = UINotificationFeedbackGenerator()
 
@@ -216,6 +217,7 @@ final class CameraController: NSObject {
         poseGuideEngine.reset()
         smartCaptureScorer.reset()
         smartCaptureScorer.clearCapturedSignature()
+        smartCaptureEngine.reset()
     }
 
     /// 文档热降频要求：`.serious / .critical` 时 Vision 强制 5fps。
@@ -325,42 +327,70 @@ final class CameraController: NSObject {
     }
 
     // MARK: - Smart-capture pipeline (抓拍：表情情绪 + 动作瞬间评分)
-
     private func processSmartCaptureFrame(pixelBuffer: CVPixelBuffer) {
         guard !isVisionBusy else { return }
         guard !isCapturingPhoto else { return }
         isVisionBusy = true
+        
         let frontCam = (facing == .front)
+        
         visionQueue.async { [weak self] in
             guard let self else { return }
-            defer { self.videoOutputQueue.async { self.isVisionBusy = false } }
-            let quality = VNDetectFaceCaptureQualityRequest()
-            let landmarks = VNDetectFaceLandmarksRequest()
-            let bodyPose = VNDetectHumanBodyPoseRequest()
-            let handPose = VNDetectHumanHandPoseRequest()
-            handPose.maximumHandCount = 2
+            
+            defer {
+                self.videoOutputQueue.async(execute: { [weak self] in
+                    self?.isVisionBusy = false
+                })
+            }
+            
+            // 1. 发起并发的第一波基础请求（人脸矩形、身体、手势）
+            let qualityRequest = VNDetectFaceCaptureQualityRequest()
+            let faceRectRequest = VNDetectFaceRectanglesRequest()
+            let bodyPoseRequest = VNDetectHumanBodyPoseRequest()
+            let handPoseRequest = VNDetectHumanHandPoseRequest()
+            handPoseRequest.maximumHandCount = 2
+            
             let orientation: CGImagePropertyOrientation = frontCam ? .leftMirrored : .right
             let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
-            do {
-                try handler.perform([quality, landmarks, bodyPose, handPose])
-                let score = self.smartCaptureScorer.evaluate(
-                    qualityObservations: quality.results ?? [],
-                    landmarkObservations: landmarks.results ?? [],
-                    bodyPoseObservations: bodyPose.results ?? [],
-                    handPoseObservations: handPose.results ?? []
-                )
-                DispatchQueue.main.async {
-                    self.delegate?.cameraController(self, didUpdateCaptureScore: score)
+            
+            try? handler.perform([qualityRequest, faceRectRequest, bodyPoseRequest, handPoseRequest])
+            
+            // 2. 检查有没有拿到脸，如果拿到了，串联进行关键点深度解析
+            var fullyLoadedFaceResults: [VNFaceObservation]? = nil
+            if let faceResults = faceRectRequest.results, let primaryFace = faceResults.first {
+                let faceLandmarksRequest = VNDetectFaceLandmarksRequest()
+                faceLandmarksRequest.inputFaceObservations = [primaryFace]
+                try? handler.perform([faceLandmarksRequest])
+                fullyLoadedFaceResults = faceLandmarksRequest.results
+            }
+            
+            // 旧的打分器更新逻辑（保留你原有的 UI 回调）
+            let score = self.smartCaptureScorer.evaluate(
+                qualityObservations: qualityRequest.results ?? [],
+                landmarkObservations: fullyLoadedFaceResults ?? [],
+                bodyPoseObservations: bodyPoseRequest.results ?? [],
+                handPoseObservations: handPoseRequest.results ?? []
+            )
+            DispatchQueue.main.async {
+                self.delegate?.cameraController(self, didUpdateCaptureScore: score)
+            }
+            
+            // 3. 核心抓拍审计：即便 fullyLoadedFace 为 nil（孩子侧身或背对跳舞），
+            // 只要有 bodyPoseObservations，跌倒检测和跳跃最高点算法依旧能够完美运转！
+            let shouldCapture = self.smartCaptureEngine.evaluate(
+                validFace: fullyLoadedFaceResults?.first,
+                bodyPoseObservations: bodyPoseRequest.results ?? [],
+                handPoseObservations: handPoseRequest.results ?? []
+            )
+            
+            if shouldCapture {
+                self.sessionQueue.async {
+                    self.performPhotoCapture(auto: true)
                 }
-                if self.smartCaptureScorer.shouldCapture(score: score) {
-                    self.sessionQueue.async { self.performPhotoCapture(auto: true) }
-                }
-            } catch {
-                DispatchQueue.main.async { self.delegate?.cameraController(self, didFail: error) }
             }
         }
     }
-
+    
     // MARK: - Camera adjustments (智拍风景模式自动调参)
 
     private func applyZoom(factor: CGFloat) {

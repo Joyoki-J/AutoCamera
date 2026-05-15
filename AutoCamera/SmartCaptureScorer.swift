@@ -35,13 +35,13 @@ private struct PoseSignature {
 }
 
 final class SmartCaptureScorer {
-    private let threshold: Float = 0.42
-    private let peakThreshold: Float = 0.55
+    private let threshold: Float = 0.38
+    private let peakThreshold: Float = 0.42
     private let requiredPassingFrames = 2
-    private let cooldownFrames = 15                // ≈0.75s @ 20fps
+    private let cooldownFrames = 45                // ≈2.25s @ 20fps
     private let minRawFaceQuality: Float = 0.22
     private let minFaceArea: Float = 0.018
-    private let noveltyMargin: Float = 0.12
+    private let noveltyMargin: Float = 0.10
     private let signatureChangeThreshold: Float = 0.22
 
     private var passingFrameCount = 0
@@ -66,9 +66,7 @@ final class SmartCaptureScorer {
     func reset() {
         lock.lock(); defer { lock.unlock() }
         passingFrameCount = 0
-        cooldown = 0
-        recentScores.removeAll()
-        recentFaceBoxes.removeAll()
+        // 保留 cooldown、recentScores、recentFaceBoxes：它们是防止连拍和手势重复触发的关键保护机制
         previousMouthOpenness = nil
         previousEyebrowLift = nil
         previousEyeOpenness = nil
@@ -123,7 +121,7 @@ final class SmartCaptureScorer {
         let gesture = handGestureScore(handPoseObservations)
         let composition = compositionScore(for: best)
         let moment = clamped(emotion * 0.50 + max(motion, expressionChange) * 0.22 + gesture * 0.20 + composition * 0.08)
-        let value = clamped(emotion * 0.38 + gesture * 0.22 + motion * 0.14 + composition * 0.12 + quality * 0.08 + expressionChange * 0.04 + wideEyes * 0.02)
+        let value = clamped(emotion * 0.45 + gesture * 0.18 + motion * 0.12 + composition * 0.10 + quality * 0.08 + expressionChange * 0.05 + wideEyes * 0.02)
 
         let score = SmartCaptureScore(value: value,
                                       captureQuality: quality,
@@ -194,23 +192,32 @@ final class SmartCaptureScorer {
         let novelPoseTrigger = hasLastCapture
             && sigDist >= signatureChangeThreshold
             && score.emotionScore >= 0.28
-            && score.value >= 0.38
+            && score.value >= 0.35
             && passingFrameCount >= 1
 
         // 手势直接触发（阈值降低，响应更快）
-        let gestureTrigger = score.gestureScore >= 0.60 && gestureNoveltyOK()
+        let gestureTrigger = score.gestureScore >= 0.55 && gestureNoveltyOK()
 
         // 情绪峰值（降低门槛）
-        let emotionalPeak = score.emotionScore >= peakThreshold && score.compositionScore >= 0.25 && isNovel
+        let emotionalPeak = score.emotionScore >= peakThreshold && score.compositionScore >= 0.20
+
+        // 显著表情直接触发（微笑、瞪眼、挑眉、张嘴等）
+        let expressionPeak = (score.smileProbability >= 0.45 || score.wideEyesScore >= 0.40 || score.eyeOpenness >= 0.70)
+            && score.captureQuality >= 0.22
+            && score.compositionScore >= 0.20
+            && passingFrameCount >= 1
 
         // 动作峰值
-        let actionPeak = score.motionScore >= 0.50
-            && (score.emotionScore >= 0.30 || score.gestureScore >= 0.40)
+        let actionPeak = score.motionScore >= 0.45
+            && (score.emotionScore >= 0.28 || score.gestureScore >= 0.35)
 
         // 持续高分
-        let sustained = passingFrameCount >= requiredPassingFrames && isNovel && score.value >= 0.42
+        let sustained = passingFrameCount >= requiredPassingFrames && isNovel && score.value >= 0.38
 
-        let should = novelPoseTrigger || gestureTrigger || emotionalPeak || actionPeak || sustained
+        // 首次拍照特殊通道：没有任何历史签名时降低门槛，让第一次表情/动作更容易触发
+        let firstCapture = !hasLastCapture && score.value >= 0.35 && passingFrameCount >= 1 && score.captureQuality >= 0.22
+
+        let should = novelPoseTrigger || gestureTrigger || emotionalPeak || expressionPeak || actionPeak || sustained || firstCapture
         if should {
             cooldown = cooldownFrames
             passingFrameCount = 0
@@ -222,9 +229,11 @@ final class SmartCaptureScorer {
     }
 
     /// 手势需“出现 → 消失 → 再出现”才算一次新动作，不会一直比耶被吃成连拍。
+    /// 窗口扩大到 12 帧、阈值降到 0.30，防止手势检测短暂掉帧导致误判为"新动作"。
     private func gestureNoveltyOK() -> Bool {
-        let recent = recentScores.suffix(8).map(\.gestureScore)
-        guard recent.contains(where: { $0 < 0.35 }) else { return false }
+        let recent = recentScores.suffix(12).map(\.gestureScore)
+        guard recent.count >= 4 else { return true }
+        guard recent.contains(where: { $0 < 0.30 }) else { return false }
         return true
     }
 
